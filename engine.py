@@ -302,7 +302,11 @@ def groq_classify(row: dict[str, str], api_key: str, model: str = DEFAULT_MODEL,
         def _send(payload: dict[str, Any]) -> dict[str, Any]:
             request = Request("https://api.groq.com/openai/v1/chat/completions",
                               data=json.dumps(payload).encode("utf-8"),
-                              headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                              headers={
+    "Authorization": f"Bearer {api_key}",
+    "Content-Type": "application/json",
+    "User-Agent": "urban-company-evidence-discovery/1.0",
+},
                               method="POST")
             try:
                 with urlopen(request, timeout=45) as response:
