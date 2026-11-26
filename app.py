@@ -13,6 +13,8 @@ from pathlib import Path
 
 import streamlit as st
 
+from insights import QUESTIONS, OPPORTUNITIES, join_predictions, research_evidence, question_status, segment_counts, opportunity_table, validate_imported_predictions
+
 from engine import (
     DEFAULT_MODEL, HUMAN_FIELDS, TAXONOMY, check_evidence, csv_bytes,
     eligible_rows, evaluation_table, groq_classify, read_csv_file, read_csv_text,
@@ -38,13 +40,14 @@ def config_value(name: str, fallback: str = "") -> str:
 
 
 st.title("Urban Company — AI Evidence Discovery")
-st.caption("Step 1.4.2 · Public Indian home-service evidence · Behavioural analysis, not sentiment scoring")
+st.caption("Research upgrade · Public Indian home-service evidence · Behavioural analysis, not sentiment scoring")
 
 with st.sidebar:
     st.header("Evidence inputs")
     st.caption("The 37-record starter batch and approved golden set are bundled. Upload newer CSVs to replace either one.")
     evidence_upload = st.file_uploader("AI input CSV", type="csv", key="evidence_csv")
     golden_upload = st.file_uploader("Human golden set CSV", type="csv", key="golden_csv")
+    prediction_upload = st.file_uploader("Previously exported AI predictions CSV (optional)", type="csv", key="predictions_csv", help="Restore authentic completed Groq predictions after a Streamlit session reset. These are validated against current source gates.")
     st.divider()
     st.header("AI configuration")
     key_from_secrets = config_value("GROQ_API_KEY")
@@ -79,6 +82,7 @@ if st.session_state.get("input_signature") != fingerprint:
     st.session_state["human_corrections"] = {}
     st.session_state["verified_conditional"] = []
     st.session_state["verified_hold"] = []
+    st.session_state["predictions_import_signature"] = None
 
 st.sidebar.header("Source verification gate")
 conditional = [r for r in rows if "conditional" in r.get("source_gate", "").lower()]
@@ -99,6 +103,32 @@ else:
 
 eligible, rejected = eligible_rows(rows, verified_conditional, verified_hold)
 eligible_ids = {r["record_id"] for r in eligible}
+if prediction_upload is not None:
+    upload_bytes = prediction_upload.getvalue()
+    import_signature = hashlib.sha256(upload_bytes + evidence_bytes + str(sorted(eligible_ids)).encode()).hexdigest()
+    if st.session_state.get("predictions_import_signature") != import_signature:
+        try:
+            restored, import_problems = validate_imported_predictions(read_csv_text(upload_bytes), rows, eligible_ids)
+            st.session_state["ai_predictions"].update(restored)
+            st.session_state["predictions_import_signature"] = import_signature
+            st.session_state["prediction_import_problems"] = import_problems
+        except (ValueError, UnicodeDecodeError) as exc:
+            st.sidebar.error(f"Could not import predictions: {exc}")
+    if st.session_state.get("prediction_import_problems"):
+        with st.sidebar.expander("Excluded prediction rows"):
+            st.write(st.session_state["prediction_import_problems"])
+# Bundled authentic prediction export from the user's previously completed Groq run.
+# Explicit opt-in is required; the app does not claim new AI calls were made.
+if st.sidebar.button("Load 24 saved Groq predictions", help="Restores the recorded 24 real model outputs for research exploration. These were produced previously, not by a new API call."):
+    try:
+        saved = read_csv_file(ROOT / "data/ai_predictions_24.csv")
+        restored, issues = validate_imported_predictions(saved, rows, eligible_ids)
+        st.session_state["ai_predictions"].update(restored)
+        st.sidebar.success(f"Restored {len(restored)} saved AI results")
+        if issues:
+            st.sidebar.warning(f"{len(issues)} imported results were excluded. Check source gates.")
+    except (ValueError, OSError) as exc:
+        st.sidebar.error(f"Could not load saved predictions: {exc}")
 preds: dict = st.session_state["ai_predictions"]
 corrections: dict = st.session_state["human_corrections"]
 
@@ -113,8 +143,9 @@ m4.metric("AI predictions completed", len(preds))
 
 st.caption("Public posts are a self-selected sample, not Urban Company booking-event data. All unproven 90-day return outcomes remain unknown.")
 
-overview, quality_tab, ai_tab, review_tab, eval_tab = st.tabs([
-    "01 · Evidence", "02 · Quality gates", "03 · AI classification", "04 · Human review", "05 · Evaluation"
+overview, quality_tab, ai_tab, review_tab, eval_tab, research_tab, segment_tab, opportunity_tab = st.tabs([
+    "01 · Evidence", "02 · Quality gates", "03 · AI classification", "04 · Human review", "05 · Evaluation",
+    "06 · Research questions", "07 · Segments", "08 · Opportunities"
 ])
 
 with overview:
@@ -274,5 +305,65 @@ with eval_tab:
                  "• Each 90-day status remains unknown unless source language explicitly establishes the required timing and completion.\n\n"
                  "• Do not claim a population repeat rate from public posts.")
 
+
+# Exploratory analyses depend ONLY on successfully classified, currently eligible public evidence.
+classified = join_predictions(rows, list(preds.values()), eligible_ids)
+with research_tab:
+    st.subheader("Eight assignment research questions — evidence coverage")
+    st.warning("The app reports partial signals, not completed answers where source evidence is missing. Public posts cannot determine qualified 90-day retention or distinguish silent non-returners.")
+    if not classified:
+        st.info("Run AI classification or upload your previously exported AI predictions CSV in the sidebar first.")
+    else:
+        coverage = []
+        for qid, question, _ in QUESTIONS:
+            matched = research_evidence(qid, classified)
+            status, limitation = question_status(qid, classified)
+            coverage.append({"question_id": qid, "question": question, "coverage": status, "supporting_observations": len(matched), "limitation": limitation})
+        st.dataframe(coverage, use_container_width=True, hide_index=True)
+        st.download_button("Download question coverage", csv_bytes(coverage), file_name="urban_company_research_question_coverage.csv", mime="text/csv")
+        qid = st.selectbox("Inspect supporting evidence", [q[0] for q in QUESTIONS], format_func=lambda x:next(q[1] for q in QUESTIONS if q[0]==x))
+        chosen = research_evidence(qid, classified)
+        status, gap = question_status(qid, classified)
+        st.markdown(f"**Coverage:** {status}. {gap}")
+        if chosen:
+            evidence_table = [{"record_id":r["record_id"], "source":r["source_type"], "category":r["service_category"], "city":r["city"],
+                               "primary_theme":r["primary_theme"], "behavior":r.get("ai_behavior_description",""),
+                               "reported_alternative":r.get("ai_external_alternative",""), "unmet_need":r.get("ai_unmet_need",""),
+                               "repeat_90d":r.get("ai_repeat_90d_status","unknown"), "source_url":r["source_url"]} for r in chosen]
+            st.dataframe(evidence_table, use_container_width=True, hide_index=True, column_config={"source_url":st.column_config.LinkColumn("Original source")})
+            st.download_button("Download selected evidence",csv_bytes(evidence_table),file_name=f"research_{qid}_evidence.csv",mime="text/csv")
+        else:
+            st.info("No source-grounded supporting records in the eligible classified evidence.")
+        st.caption("Source counts represent observed public posts, not the share of all customers. A theme match is a clue, not proof of expectation or repeat motive.")
+
+with segment_tab:
+    st.subheader("Descriptive comparisons by city and service category")
+    st.info("These are counts of non-representative classified observations. Household type and first-acquisition channel are not recorded consistently; do not fabricate them.")
+    if classified:
+        dimension = st.selectbox("Compare themes by", ["service_category", "city", "source_type"], format_func=lambda x:x.replace("_"," ").title())
+        summary = segment_counts(classified, dimension)
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+        st.download_button("Download segment observations",csv_bytes(summary),file_name="urban_company_segment_theme_counts.csv",mime="text/csv")
+        st.caption(f"{len(classified)} eligible classified source observations; no adjusted city/category incidence estimates.")
+    else:
+        st.info("Classify evidence or upload the authentic predictions CSV to view these comparisons.")
+
+with opportunity_tab:
+    st.subheader("Candidate opportunities — transparent evidence comparison")
+    st.warning("Sorted by diversity of the observed source sample, NOT by estimated business impact. Effect size, segment reach and solution differentiation need primary research and validation.")
+    if classified:
+        candidates = opportunity_table(classified)
+        st.dataframe(candidates, use_container_width=True, hide_index=True)
+        st.download_button("Download candidate opportunity table",csv_bytes(candidates),file_name="urban_company_opportunity_candidates.csv",mime="text/csv")
+        selected = st.selectbox("Inspect evidence for an opportunity",list(OPPORTUNITIES))
+        subset = [r for r in classified if r["primary_theme"] in OPPORTUNITIES[selected]["themes"]]
+        st.write(f"**Potential mechanism:** {OPPORTUNITIES[selected]['mechanism']}")
+        st.write(f"**Interview test:** {OPPORTUNITIES[selected]['validation']}")
+        st.dataframe([{"record_id":r["record_id"],"theme":r["primary_theme"],"observed_behavior":r.get("ai_behavior_description",""),"source_url":r["source_url"]} for r in subset],
+                     use_container_width=True,hide_index=True,column_config={"source_url":st.column_config.LinkColumn("Source")})
+        st.markdown("**Still unknown:** true 90-day repeat outcomes; target-segment prevalence; causal effect on consideration or booking; customers with no further service need.")
+    else:
+        st.info("Run classification or import a genuine prediction export first.")
+
 st.divider()
-st.caption("Urban Company fellowship research prototype · No account access, no booking actions, no scraping · Step 1.4.3 will build opportunity comparison from reviewed outputs.")
+st.caption("Urban Company fellowship research prototype · No account access, no booking actions, no scraping · Research questions and opportunity comparisons are exploratory and require human validation.")
