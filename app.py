@@ -137,7 +137,7 @@ with tabs[4]:
     st.caption('V1 historical agreement: 13/20 (65%). Re-run both models on the same approved reference records for a comparable result. Phase 1 and Phase 2 labels were AI-assisted; optional holdout must be independently labelled.')
     st.write('Phase 2 reference approval (separate from source approval)')
     st.dataframe(g2,hide_index=True,use_container_width=True)
-    with st.form('gold2'):
+    with st.form('gold2_review_form'):
         gr=st.selectbox('Reference record',[r['record_id'] for r in g2]); confirmed=st.checkbox('I reviewed and accept the source, manual label, behaviour and notes')
         if st.form_submit_button('Approve Phase 2 reference'):
             if not confirmed: st.error('Explicit review confirmation required.')
