@@ -3,12 +3,12 @@ from pathlib import Path
 from datetime import datetime, timezone
 import hashlib
 import streamlit as st
-from engine import (REQUIRED, HUMAN_FIELDS, TAXONOMY, QUESTIONS, DEFAULT_MODEL, read_csv_text, csv_bytes, check_evidence, groq_classify)
+from engine import (REQUIRED, HUMAN_FIELDS, TAXONOMY, QUESTIONS, DEFAULT_MODEL, CLASSIFIER_REVISION, PROPERTIES, prediction_fingerprint, validate_model_answer, read_csv_text, csv_bytes, check_evidence, groq_classify)
 from workflow import prepare, route, approved_reference, score, analysis_rows, opportunities
 
 ROOT=Path(__file__).parent
 st.set_page_config(page_title='Urban Company | Discovery V2',page_icon='🔎',layout='wide')
-st.title('Urban Company | Discovery Engine V2')
+st.title('Urban Company | Discovery Engine V2.1')
 st.caption('Consumer Growth · 90-day repeat completion · Public evidence research')
 st.info('Public reviews are directional, not booking-event data. Repeat usage signals do not establish qualifying 90-day repeat outcomes. No causal or population retention estimate is produced.')
 
@@ -27,6 +27,7 @@ with st.sidebar:
     holdout_up=st.file_uploader('Optional independent holdout CSV',type='csv')
     key=secret('GROQ_API_KEY') or st.text_input('Groq API key',type='password')
     model=st.text_input('Model',value=secret('GROQ_MODEL',DEFAULT_MODEL))
+    resume_up=st.file_uploader('Resume V2.1 raw AI evidence log',type='csv',help='Only successful predictions with matching classifier revision, model and evidence fingerprint can be restored. V2 baseline predictions cannot be mixed into V2.1.')
     exploratory=st.checkbox('Allow provisional exploration',value=False,help='Allows ready or source-checked pending observations to be classified. Final opportunity rankings still require human approval.')
     st.caption('No API calls until you select Run classification. Never commit your API key.')
 try:
@@ -79,9 +80,32 @@ with tabs[0]:
 with tabs[1]:
     st.subheader('Groq structured behavioural classification')
     st.caption('Only record ID, category, city and observation are sent to the model. Human labels, approval notes and screening rationale are never included in the prompt.')
-    sig=hashlib.sha256(csv_bytes([{k:r.get(k,'') for k in REQUIRED} for r in rows])+model.encode()).hexdigest()
+    sig=hashlib.sha256(csv_bytes([{k:r.get(k,'') for k in REQUIRED} for r in rows])+model.encode()+CLASSIFIER_REVISION.encode()).hexdigest()
     if st.session_state.get('prediction_sig')!=sig:
         st.session_state.update(prediction_sig=sig,predictions=[],corrections={})
+    if resume_up is not None and st.button('Restore saved V2.1 predictions'):
+        try:
+            saved=read_csv_text(resume_up.getvalue())
+            by_id={r['record_id']:r for r in rows}
+            restored={}
+            skipped=0
+            for p in saved:
+                row=by_id.get(p.get('record_id'))
+                if not row or p.get('prediction_status')!='AI success' or p.get('classifier_revision')!=CLASSIFIER_REVISION or p.get('model_id')!=model or p.get('input_fingerprint')!=prediction_fingerprint(row,model):
+                    skipped+=1
+                    continue
+                try:
+                    clean=validate_model_answer({k:p.get(k) for k in PROPERTIES},row)
+                except ValueError:
+                    skipped+=1
+                    continue
+                restored[row['record_id']]={**p,**clean,'source_url':row['source_url']}
+            existing={p['record_id']:p for p in st.session_state.predictions}
+            existing.update(restored)
+            st.session_state.predictions=list(existing.values())
+            st.info(f'Restored {len(restored)} saved predictions; skipped {skipped} incompatible or failed records. Imported predictions are user-supplied logs, not a fresh live run.')
+        except Exception as e:
+            st.error(f'Cannot restore log: {e}')
     active={r['record_id'] for r in eligible}
     batch=st.number_input('Maximum records this run',min_value=1,max_value=max(1,len(eligible)),value=min(20,max(1,len(eligible))))
     if st.button('Run classification',disabled=not eligible or not key, type='primary'):
@@ -185,4 +209,4 @@ with tabs[5]:
         if logs: st.download_button('Export correction log',csv_bytes(logs),'human_corrections.csv','text/csv')
         st.caption('Corrections change theme and behaviour in the reviewed view only; question extracts still require review. Raw predictions remain unchanged for evaluation.')
     else: st.info('Classify evidence first.')
-    st.warning('Review decisions and predictions live in the browser session. Export before closing; upload saved evidence and reference CSVs to restore decisions. Raw prediction re-import is not implemented in this version.')
+    st.warning('Review decisions and predictions live in the browser session. Export before closing; upload saved evidence and reference CSVs to restore decisions. V2.1 raw prediction logs can be restored using the sidebar and Classify tab. Earlier revisions are not compatible.')
