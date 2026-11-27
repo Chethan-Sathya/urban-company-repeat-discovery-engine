@@ -1,102 +1,44 @@
-# Urban Company — AI Evidence Discovery Engine
+# Urban Company Discovery Engine V2
 
-**Step 1.4.2 | Build + evaluate structured behaviour classification**
-
-This is a deployable Streamlit application. It reads a CSV of public home-service customer evidence, detects data-quality issues, classifies eligible observations via Groq's structured-output API, preserves human review edits, and evaluates AI theme agreement against an independently approved 20-record reference set.
-
-It **does not** scrape Urban Company, access customer accounts, book services, or message service professionals. It cannot calculate Urban Company's actual 90-day repeat-booking rate.
+Upgrade of the existing Streamlit/Groq research engine. V1 remains unchanged until you deliberately deploy this package. This is a public-evidence research tool, not the customer-facing MVP or a booking analytics system.
 
 ## Included files
+- `app.py`: Streamlit dashboard (six tabs)
+- `engine.py`: adapted V1 classifier, date validation, 10-theme taxonomy, eight question extracts, repeat-outcome guardrail
+- `workflow.py`: approval gates, reference evaluation, descriptive opportunity analysis
+- `data/evidence_master.csv`: screened 97 candidates (includes original 37)
+- `data/golden_v1.csv`: 20 previously approved AI-assisted reference items
+- `data/golden_v2_pending.csv`: 20 labelled Phase 2 items; 17 source-checked pending human approval, 3 on hold
+- `data/holdout_optional.csv`: 15 optional unlabelled candidates; not evaluated by default
+- `test_v2.py`: offline unit tests using a mocked API response, not live AI predictions
 
-| File | Purpose |
-| --- | --- |
-| `app.py` | Streamlit user interface |
-| `engine.py` | Input checks, source gates, Groq AI classification and evaluation |
-| `data/ai_input_37.csv` | Unlabelled model input (37 source observations) |
-| `data/golden_set_20.csv` | Approved manually reviewed reference (never included in AI prompt) |
-| `data/validation_log_37.csv` | Existing source and deduplication checks |
-| `tests/test_engine.py` | Offline unit tests |
-| `.streamlit/secrets.toml.example` | Example configuration; **never** commit real keys |
-| `EVIDENCE_LOG_STATUS.md` | Current, honest evidence and evaluation status |
-
-## 1. Run locally
-
-```bash
-python -m pip install -r requirements.txt
-streamlit run app.py
+## Run locally (Windows PowerShell)
+Extract the ZIP, open its `uc_discovery_v2` folder in VS Code, and open Terminal:
+```powershell
+py -m pip install -r requirements.txt
+py -m unittest -v test_v2.py
+py -m streamlit run app.py
 ```
+Paste your Groq key in the app sidebar, or use `.streamlit/secrets.toml` locally (never commit this file).
 
-The app opens on localhost. Without an API key, evidence exploration, validation and golden-set checking work, but **AI classifications are disabled**. This is intentional: the engine never invents predictions or a simulated agreement score.
+## Deploy in existing repository without replacing V1
+1. Open your existing GitHub repository `Chethan-Sathya/urban-company-repeat-discovery-engine`.
+2. Create a branch called `v2` from `main` (GitHub branch selector). Keep `main` unchanged.
+3. On `v2`, upload the extracted package files and `data` directory at repository root, including `app.py`, `engine.py`, `workflow.py`, `requirements.txt`, `README.md`, `test_v2.py`, `.gitignore`. Commit to `v2` only. Existing extra V1 files can remain.
+4. In Streamlit Community Cloud create a separate app for the same repository, branch `v2`, main file `app.py`. Add `GROQ_API_KEY = "YOUR_KEY"` in the app's secrets. Do not paste the real key in GitHub.
+5. Launch V2, verify the dashboard and classify 1 approved record. If successful, run the remaining records in batches. Keep V1 live until V2 passes your checks. A branch can later be merged; no merge is necessary for testing.
 
-## 2. Configure the Groq API key
+## Research workflow
+1. Evidence & approval: inspect sources and approval gates. Initial 20 baseline approvals are carried forward, not fresh source verification. 17 Phase 2 candidates are source-checked but require your sign-off. You can select them for batch approval **only after** accepting their observations. Three source-checked holds and two pre-existing low-confidence holds remain excluded. Other candidates need source and human approval. Source approval is not proof of a real booking.
+2. Evaluation: finalize the approved Phase 2 reference labels before seeing new AI predictions. The 20 V1 and 17 potentially eligible Phase 2 records are AI-assisted references; report separately. Optional holdout should be independently labelled and approved before predictions. Export reviewed references and evidence master.
+3. Classify: use strict approval mode for final evidence. Optional exploratory mode includes pending ready/source-checked candidates but not holds. API failures remain errors; no rule-based fallback or fabricated predictions. Classifications are grounded in supplied paraphrases, not fetched live pages.
+4. Research questions: inspect extracted answers and supporting IDs, links, paraphrases and limitations. Blank support is reported as a research gap. Q6 cannot establish comparative 90-day cohort behaviour; Q7 is descriptive.
+5. Segments & opportunities: approved classified evidence only. Opportunity counts are first-hand unmet-need signals, not causal impact estimates or severity. Human review and primary research are needed to prioritize.
+6. Evaluation: exact theme agreement, evaluation coverage, per-class precision/recall/F1 and macro F1 over the union of observed and predicted labels among evaluated items. Compare V1 vs V2 on the same 20 records using the same conditions; compare the 17 new items separately. Historical 65% is not V2 performance. Manual behavioural and grounding assessment is separate.
+7. Human corrections: correct theme and behaviour, record rationale and grounding verdict. Unsupported audited outputs excluded from analytical views. Raw predictions remain intact for evaluation. Research question extracts are not automatically corrected; inspect separately.
+8. Export before closing. Session state is temporary; saved evidence/references can be reuploaded. Prediction re-import is not implemented. Use exports for the assignment evidence log.
 
-Obtain an active Groq API key in your Groq account, then either:
+## Validation scope
+Collection window: 26 Nov 2025 through 26 Nov 2026 (month-only dates preserved; boundary months flagged). All 97 rows pass structural blocking checks. At package creation strict routing permits 20 and exploratory routing permits 48. Five are on hold (including three Phase 2 source checks); 72 pending. No qualifying 90-day outcomes are established in supplied data. The current public-paraphrase classifier conservatively always returns unknown for this metric; it is not suitable for verified booking-event cohort computation.
 
-```bash
-# macOS / Linux
-export GROQ_API_KEY='your-key-here'
-
-# PowerShell
-$env:GROQ_API_KEY='your-key-here'
-```
-
-Or create a local `.streamlit/secrets.toml` from the example, with actual `GROQ_API_KEY`. This file is excluded by `.gitignore`.
-
-By default the app uses `openai/gpt-oss-20b`, which Groq documents as supporting strict structured outputs. The legacy `llama-3.3-70b-versatile` was deprecated for non-enterprise use in 2026, so do not copy the old Groww assignment's model setting blindly. You can override `GROQ_MODEL` only with a currently supported, schema-capable model.
-
-## 3. Upload, validate and classify
-
-1. Start with the bundled 37-record input and 20-record golden set.
-2. On **Evidence**, inspect original links and descriptions.
-3. On **Quality gates**, check duplicate IDs, URLs and source objects. A unique URL is *not* proof that the customer account is independent.
-4. The default source gate includes **24 ready/provisional** observations. **11 Trustpilot** direct-review links remain conditional until individually checked; **2 low-confidence** observations remain held.
-5. In the sidebar, only mark individual Trustpilot IDs verified after opening those direct review links. A held record requires a written explanation before overriding.
-6. On **AI classification**, run 3 records first. Only public evidence paraphrases and category/city metadata are sent to Groq; reference labels are not sent.
-7. Inspect structured output. Where qualifying timing and completion are not explicit, 90-day status remains `unknown`.
-8. On **Human review**, save approval/corrections/rejection decisions and export the review-audit CSV.
-9. On **Evaluation**, see how many of the 20 gold records were actually classified, calculate agreement only on real AI outputs, inspect mismatches, and download the audit.
-10. Save exported CSVs. Streamlit session data is not a persistent database and will be lost if the session is reset.
-
-**Important:** A self-reported repeat customer is not a *confirmed qualifying 90-day repeater*. Completion, timing, and exclusions (refunds/warranty/redos) must all be established.
-
-## 4. Deploy on Streamlit Community Cloud
-
-1. Create a new GitHub repository, e.g. `urban-company-repeat-discovery-engine`.
-2. Upload **all contents of this folder**, preserving `data/`, `tests/`, and `.streamlit/config.toml`.
-3. Do **not** upload `.streamlit/secrets.toml` or any personal API keys.
-4. Open [Streamlit Community Cloud](https://share.streamlit.io), choose **Create app / Deploy**, and select your GitHub repository.
-5. Set the entrypoint to `app.py` and configure secrets in **Advanced settings**:
-
-```toml
-GROQ_API_KEY = "YOUR_REAL_KEY"
-GROQ_MODEL = "openai/gpt-oss-20b"
-```
-
-6. Deploy and open the public app in an incognito window.
-7. Test the full chain: 1 real model classification, review correction, 20-record evaluation (requires all 20 real predictions), CSV download, and a fresh session.
-8. Add the app link to the final deck and the Evidence Log only after the app is actually deployed and tested.
-
-References: https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy ; https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/secrets-management ; https://console.groq.com/docs/structured-outputs ; https://console.groq.com/docs/changelog
-
-## 5. Quality and privacy caveats
-
-- The original sample has 24 Reddit observations, 11 Trustpilot reviews, and 2 complaint-site observations. It does not represent the UC customer population; complaint-heavy source bias and silent non-returners remain major gaps.
-- Source review flags are inherited; automated checks cannot independently prove review authenticity, source geography, completed bookings, or cohort membership.
-- The golden-set manual decisions were reviewed after AI suggestions were shown, so this is **not a fully blind** reference set. Disclose that limitation in the final Evidence Log.
-- 20 reference records are from Reddit and consumer complaints, not Trustpilot. Evaluate a second, separately human-labelled Trustpilot sample before claiming model performance generalizes to those reviews.
-- The tool analyzes paraphrases, not raw review text. Do not claim quotations or detailed customer histories beyond those paraphrases.
-- The source gate is strict by default; users can approve conditional sources after real checking. Any override must be documented and should not be treated as automated source verification.
-- User-supplied evidence must be public/allowed. No personal documents, addresses, phone numbers, customer screenshots or invoices.
-- AI evaluations measure **theme agreement**, not the causal effect on 90-day repeat bookings.
-
-## 6. Tests and reproducibility
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-All tests operate offline with mocked AI responses. They verify JSON schema handling, reference-label isolation, safe unknown repeat status, duplicates, source gating and evaluation math. Passing tests does **not** imply the remote Groq API was successfully called or that the UI has been deployed.
-
-## Next assignment step
-
-**Step 1.4.3 — Evidence-backed opportunity dashboard:** use the reviewed AI output to compare customer behaviours with denominators, sample sizes, evidence quality, positive/negative source balance and business-outcome influence. Do not fabricate an uplift estimate.
+Offline tests cover record count/unique URLs, date parsing and window, evidence gates, prompt leakage, forced unknown repeat outcome, and agreement/coverage. No live Groq run or Streamlit runtime smoke test was performed in the build environment (Streamlit unavailable; no user API credentials). Run the local/deployed smoke test before claiming successful deployment or model performance. No source links were newly checked for this build. Source access can change.

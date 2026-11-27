@@ -1,369 +1,188 @@
-"""Urban Company | Evidence Discovery Engine (Step 1.4.2).
-
-Start with: streamlit run app.py
-No logged-in app scraping. This app analyzes uploaded/public evidence paraphrases.
-"""
-from __future__ import annotations
-
-import hashlib
-import os
-from collections import Counter
-from datetime import datetime, timezone
+"""Urban Company Discovery Engine V2 — Streamlit research workspace."""
 from pathlib import Path
-
+from datetime import datetime, timezone
+import hashlib
 import streamlit as st
+from engine import (REQUIRED, HUMAN_FIELDS, TAXONOMY, QUESTIONS, DEFAULT_MODEL, read_csv_text, csv_bytes, check_evidence, groq_classify)
+from workflow import prepare, route, approved_reference, score, analysis_rows, opportunities
 
-from insights import QUESTIONS, OPPORTUNITIES, join_predictions, research_evidence, question_status, segment_counts, opportunity_table, validate_imported_predictions
+ROOT=Path(__file__).parent
+st.set_page_config(page_title='Urban Company | Discovery V2',page_icon='🔎',layout='wide')
+st.title('Urban Company | Discovery Engine V2')
+st.caption('Consumer Growth · 90-day repeat completion · Public evidence research')
+st.info('Public reviews are directional, not booking-event data. Repeat usage signals do not establish qualifying 90-day repeat outcomes. No causal or population retention estimate is produced.')
 
-from engine import (
-    DEFAULT_MODEL, HUMAN_FIELDS, TAXONOMY, check_evidence, csv_bytes,
-    eligible_rows, evaluation_table, groq_classify, read_csv_file, read_csv_text,
-    records_by_theme, source_mix, validate_golden,
-)
+def secret(k,default=''):
+    try: return st.secrets.get(k,default)
+    except Exception: return default
 
-ROOT = Path(__file__).parent
-st.set_page_config(page_title="Urban Company | AI Evidence Discovery", layout="wide", page_icon="🔎")
-st.markdown("""<style>
-.block-container {padding-top: 1.6rem; max-width: 1300px;}
-[data-testid=\"stMetric\"] {background: #F1F5F4; padding: 14px; border-radius: 9px;}
-hr {margin: 1rem 0;}
-</style>""", unsafe_allow_html=True)
-
-
-def config_value(name: str, fallback: str = "") -> str:
-    try:
-        if name in st.secrets:
-            return str(st.secrets[name])
-    except (FileNotFoundError, KeyError):
-        pass
-    return os.environ.get(name, fallback)
-
-
-st.title("Urban Company — AI Evidence Discovery")
-st.caption("Research upgrade · Public Indian home-service evidence · Behavioural analysis, not sentiment scoring")
+def load(upload,name):
+    return read_csv_text(upload.getvalue() if upload is not None else (ROOT/'data'/name).read_bytes())
 
 with st.sidebar:
-    st.header("Evidence inputs")
-    st.caption("The 37-record starter batch and approved golden set are bundled. Upload newer CSVs to replace either one.")
-    evidence_upload = st.file_uploader("AI input CSV", type="csv", key="evidence_csv")
-    golden_upload = st.file_uploader("Human golden set CSV", type="csv", key="golden_csv")
-    prediction_upload = st.file_uploader("Previously exported AI predictions CSV (optional)", type="csv", key="predictions_csv", help="Restore authentic completed Groq predictions after a Streamlit session reset. These are validated against current source gates.")
-    st.divider()
-    st.header("AI configuration")
-    key_from_secrets = config_value("GROQ_API_KEY")
-    if key_from_secrets:
-        api_key = key_from_secrets
-        st.success("Groq API key configured in app secrets")
-    else:
-        api_key = st.text_input("Temporary Groq API key (optional)", type="password", help="Kept in this browser session; do not paste into source code or public screenshots.")
-        st.info("No key configured. You can inspect and validate data; live AI calls are disabled.")
-    model = config_value("GROQ_MODEL", DEFAULT_MODEL)
-    st.caption(f"Model: `{model}`")
-    st.caption("AI uses Groq structured outputs, not legacy deprecated model IDs.")
-    st.divider()
-    st.warning("Only public, permitted content or your own paraphrases. Do not upload invoices, addresses, phone numbers or other personal documents.")
-
+    st.header('Inputs & configuration')
+    master_up=st.file_uploader('Evidence master / saved review CSV',type='csv')
+    gold1_up=st.file_uploader('V1 reference CSV',type='csv')
+    gold2_up=st.file_uploader('Phase 2 reference CSV',type='csv')
+    holdout_up=st.file_uploader('Optional independent holdout CSV',type='csv')
+    key=secret('GROQ_API_KEY') or st.text_input('Groq API key',type='password')
+    model=st.text_input('Model',value=secret('GROQ_MODEL',DEFAULT_MODEL))
+    exploratory=st.checkbox('Allow provisional exploration',value=False,help='Allows ready or source-checked pending observations to be classified. Final opportunity rankings still require human approval.')
+    st.caption('No API calls until you select Run classification. Never commit your API key.')
 try:
-    evidence_bytes = evidence_upload.getvalue() if evidence_upload is not None else (ROOT / "data/ai_input_37.csv").read_bytes()
-    gold_bytes = golden_upload.getvalue() if golden_upload is not None else (ROOT / "data/golden_set_20.csv").read_bytes()
-    rows = read_csv_text(evidence_bytes)
-    golden = read_csv_text(gold_bytes)
-    validation = check_evidence(rows)
-    golden_check = validate_golden(golden, rows)
-except (ValueError, UnicodeDecodeError) as exc:
-    st.error(f"Input validation failed: {exc}")
-    st.stop()
-
-fingerprint = hashlib.sha256(evidence_bytes + b"|" + gold_bytes).hexdigest()
-if st.session_state.get("input_signature") != fingerprint:
-    st.session_state["input_signature"] = fingerprint
-    st.session_state["ai_predictions"] = {}
-    st.session_state["ai_errors"] = {}
-    st.session_state["human_corrections"] = {}
-    st.session_state["verified_conditional"] = []
-    st.session_state["verified_hold"] = []
-    st.session_state["predictions_import_signature"] = None
-
-st.sidebar.header("Source verification gate")
-conditional = [r for r in rows if "conditional" in r.get("source_gate", "").lower()]
-held = [r for r in rows if "hold" in r.get("source_gate", "").lower()]
-verified_conditional = set(st.sidebar.multiselect(
-    "Verified conditional review links", [r["record_id"] for r in conditional],
-    key="verified_conditional", help="Mark a review ID here ONLY after opening the exact individual review link and confirming its contents."))
-verified_hold = set(st.sidebar.multiselect(
-    "Override held rows (document first)", [r["record_id"] for r in held],
-    key="verified_hold", help="Low-confidence rows must stay excluded unless new source evidence is documented."))
-if verified_hold:
-    hold_notes = st.sidebar.text_area("Required reason for held-source override", key="hold_override_reason")
-    if len(hold_notes.strip()) < 15:
-        st.sidebar.error("Document at least 15 characters before allowing held rows")
-        verified_hold = set()
-else:
-    hold_notes = ""
-
-eligible, rejected = eligible_rows(rows, verified_conditional, verified_hold)
-eligible_ids = {r["record_id"] for r in eligible}
-if prediction_upload is not None:
-    upload_bytes = prediction_upload.getvalue()
-    import_signature = hashlib.sha256(upload_bytes + evidence_bytes + str(sorted(eligible_ids)).encode()).hexdigest()
-    if st.session_state.get("predictions_import_signature") != import_signature:
-        try:
-            restored, import_problems = validate_imported_predictions(read_csv_text(upload_bytes), rows, eligible_ids)
-            st.session_state["ai_predictions"].update(restored)
-            st.session_state["predictions_import_signature"] = import_signature
-            st.session_state["prediction_import_problems"] = import_problems
-        except (ValueError, UnicodeDecodeError) as exc:
-            st.sidebar.error(f"Could not import predictions: {exc}")
-    if st.session_state.get("prediction_import_problems"):
-        with st.sidebar.expander("Excluded prediction rows"):
-            st.write(st.session_state["prediction_import_problems"])
-# Bundled authentic prediction export from the user's previously completed Groq run.
-# Explicit opt-in is required; the app does not claim new AI calls were made.
-if st.sidebar.button("Load 24 saved Groq predictions", help="Restores the recorded 24 real model outputs for research exploration. These were produced previously, not by a new API call."):
-    try:
-        saved = read_csv_file(ROOT / "data/ai_predictions_24.csv")
-        restored, issues = validate_imported_predictions(saved, rows, eligible_ids)
-        st.session_state["ai_predictions"].update(restored)
-        st.sidebar.success(f"Restored {len(restored)} saved AI results")
-        if issues:
-            st.sidebar.warning(f"{len(issues)} imported results were excluded. Check source gates.")
-    except (ValueError, OSError) as exc:
-        st.sidebar.error(f"Could not load saved predictions: {exc}")
-preds: dict = st.session_state["ai_predictions"]
-corrections: dict = st.session_state["human_corrections"]
-
-if not golden_check["passed"]:
-    st.error("Golden-set reference is not ready: " + "; ".join(golden_check["errors"]))
-
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Evidence records", len(rows))
-m2.metric("Eligible for AI now", len(eligible))
-m3.metric("Golden-set records", len(golden))
-m4.metric("AI predictions completed", len(preds))
-
-st.caption("Public posts are a self-selected sample, not Urban Company booking-event data. All unproven 90-day return outcomes remain unknown.")
-
-overview, quality_tab, ai_tab, review_tab, eval_tab, research_tab, segment_tab, opportunity_tab = st.tabs([
-    "01 · Evidence", "02 · Quality gates", "03 · AI classification", "04 · Human review", "05 · Evaluation",
-    "06 · Research questions", "07 · Segments", "08 · Opportunities"
-])
-
-with overview:
-    st.subheader("Source mix and observed customer accounts")
-    sm = source_mix(rows)
-    st.write("Source breakdown: " + " · ".join(f"{v} {k}" for k, v in sm.items()))
-    st.info("The original 37 records were collected from Reddit, consumer complaint pages and Trustpilot. The 11 Trustpilot reviews require individual click-through verification before use in the AI run.")
-    st.warning("Do not interpret the percentage of complaints or themes as a population incidence or a 90-day repeat rate. Quiet non-returners are absent from public reviews.")
-    available_categories = sorted({r["service_category"] for r in rows})
-    selected_categories = st.multiselect("Filter by service category", available_categories, key="category_filter")
-    subset = [r for r in rows if not selected_categories or r["service_category"] in selected_categories]
-    st.dataframe([{
-        "record_id": r["record_id"], "source_type": r["source_type"],
-        "service_category": r["service_category"], "city": r["city"],
-        "observation_paraphrase": r["observation_paraphrase"],
-        "source_gate": r["source_gate"], "source_url": r["source_url"]
-    } for r in subset], use_container_width=True, hide_index=True,
-    column_config={"source_url": st.column_config.LinkColumn("Direct source link")})
-    st.download_button("Download original AI input", csv_bytes(rows), file_name="urban_company_ai_input.csv", mime="text/csv")
-
-with quality_tab:
-    st.subheader("Deduplication, source provenance and blocking conditions")
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Unique IDs", validation["unique_ids"])
-    k2.metric("Unique source URLs", validation["unique_urls"])
-    k3.metric("Data-integrity blockers", len(validation["block_ids"]))
-    if validation["block_ids"]:
-        st.error("The following IDs cannot be classified until corrected: " + ", ".join(sorted(validation["block_ids"])))
-    st.write("**Eligibility:** Ready sources are included. Conditional sources require human verification of the direct review link. Low-confidence sources remain held unless explicitly justified.")
-    st.dataframe([{"record_id": r["record_id"], "source_gate": r["source_gate"],
-                   "reason": r["eligibility_reason"], "source_url": r["source_url"]}
-                  for r in rejected], hide_index=True, use_container_width=True,
-                 column_config={"source_url": st.column_config.LinkColumn("Source")})
-    severity = Counter(i["severity"] for i in validation["issues"])
-    st.caption("Checks: " + ", ".join(f"{k}: {v}" for k,v in sorted(severity.items())))
-    with st.expander("View complete validation issue log"):
-        st.dataframe(validation["issues"], hide_index=True, use_container_width=True)
-    st.download_button("Download validation issue log", csv_bytes(validation["issues"], ["record_id", "severity", "issue"]),
-                       file_name="validation_issues.csv", mime="text/csv")
-
-with ai_tab:
-    st.subheader("Live, source-grounded AI classification")
-    st.caption("Only the AI-input CSV fields enter the model prompt. The human-label reference is never sent to the model.")
-    if not api_key:
-        st.error("A Groq API key is required for actual AI classification. The app does not fabricate predictions or substitute rule-based output.")
-    if not eligible:
-        st.warning("No eligible sources; verify or correct input records first.")
-    # Users may run one first to inspect quality/cost before expanding.
-    ready_to_run = [r for r in eligible if r["record_id"] not in preds]
-    if ready_to_run:
-        limit = st.number_input("Maximum new records per run", min_value=1,
-                                max_value=len(ready_to_run), value=min(3, len(ready_to_run)), step=1)
-    else:
-        limit = 0
-        st.success("All currently eligible evidence rows have an AI output.")
-    send_consent = st.checkbox("I confirm these are public/permitted paraphrases and understand they are sent to Groq for processing.", key="consent")
-    btn_disabled = not (api_key and eligible and golden_check["passed"] and ready_to_run and send_consent)
-    if st.button("Run actual AI classification", type="primary", disabled=btn_disabled):
-        run = ready_to_run[:int(limit)]
-        bar = st.progress(0)
-        status = st.empty()
-        for i, r in enumerate(run):
-            status.caption(f"Processing {i+1}/{len(run)} — {r['record_id']}")
-            try:
-                preds[r["record_id"]] = groq_classify(r, api_key, model)
-                st.session_state["ai_errors"].pop(r["record_id"], None)
-            except Exception as exc:
-                st.session_state["ai_errors"][r["record_id"]] = str(exc)[:400]
-                if "HTTP 429" in str(exc) or "HTTP 401" in str(exc):
-                    st.error("Groq rate limit or authentication error; stopped early. Existing outputs are preserved.")
-                    break
-            bar.progress((i + 1) / len(run))
-        status.empty()
-        st.rerun()
-    if st.session_state["ai_errors"]:
-        with st.expander("AI errors / records not counted as classified"):
-            st.json(st.session_state["ai_errors"])
-    if preds:
-        results = [preds[k] for k in sorted(preds)]
-        st.dataframe([{"record_id": p["record_id"], "primary_theme": p["primary_theme"],
-                       "behavior": p["behavior_description"], "repeat_90d_status": p["repeat_90d_status"],
-                       "customer_segment": p["customer_segment"], "limitation": p["limitation"]}
-                      for p in results], use_container_width=True, hide_index=True)
-        theme_rows = records_by_theme(results)
-        st.caption("Theme counts are only among successfully AI-classified records, not population estimates.")
-        st.dataframe(theme_rows, hide_index=True, use_container_width=True)
-        st.download_button("Download AI outputs", csv_bytes(results), file_name="urban_company_ai_predictions.csv", mime="text/csv")
-    else:
-        st.info("No live AI classifications have been generated. Once an API key is configured, start with 3 records and inspect the outputs.")
-
-with review_tab:
-    st.subheader("Human corrections to model predictions")
-    st.caption("Corrections are recorded separately and never overwrite the frozen golden-set reference.")
-    if not preds:
-        st.info("First run the AI classifier in tab 03; no model outputs exist to review.")
-    else:
-        select_id = st.selectbox("Choose a classified record", sorted(preds), key="review_record")
-        p = preds[select_id]
-        r = next(row for row in rows if row["record_id"] == select_id)
-        st.markdown("**Source observation:** " + r["observation_paraphrase"])
-        st.link_button("Open original source", r["source_url"])
-        st.write(f"**AI theme:** {p['primary_theme']}")
-        st.write(f"**AI behaviour:** {p['behavior_description']}")
-        st.write(f"**90-day status:** {p['repeat_90d_status']} · **Limitation:** {p['limitation']}")
-        with st.form("review_form"):
-            corrected_theme = st.selectbox("Human-reviewed theme", TAXONOMY,
-                                           index=TAXONOMY.index(corrections.get(select_id, {}).get("reviewed_theme", p["primary_theme"])))
-            corrected_behavior = st.text_area("Human-reviewed behaviour", value=corrections.get(select_id, {}).get("reviewed_behavior", p["behavior_description"]))
-            human_decision = st.selectbox("Review decision", ["Approve AI", "Correct AI", "Reject evidence"],
-                                         index=["Approve AI", "Correct AI", "Reject evidence"].index(corrections.get(select_id, {}).get("decision", "Approve AI")))
-            human_reason = st.text_area("Evidence-based reviewer rationale", value=corrections.get(select_id, {}).get("rationale", ""))
-            submitted = st.form_submit_button("Save review")
-        if submitted:
-            if human_decision in ("Correct AI", "Reject evidence") and len(human_reason.strip()) < 12:
-                st.error("Corrections and rejections require a short rationale.")
+    raw=load(master_up,'evidence_master.csv'); g1=load(gold1_up,'golden_v1.csv'); g2=load(gold2_up,'golden_v2_pending.csv')
+    holdout=read_csv_text(holdout_up.getvalue()) if holdout_up else []
+    rows=raw if all(k in raw[0] for k in ('source_check','review_decision','review_notes','screening')) else prepare(raw,g2,g1)
+    check_evidence(rows)
+except Exception as e:
+    st.error(f'Input error: {e}'); st.stop()
+# New uploads invalidate in-session state. AI predictions tied to actual input + model.
+context=hashlib.sha256(csv_bytes(rows)+csv_bytes(g1)+csv_bytes(g2)+csv_bytes(holdout)).hexdigest()
+if st.session_state.get('context')!=context:
+    st.session_state.update(context=context, review_rows=rows, predictions=[], corrections={}, gold2=g2)
+rows=st.session_state.review_rows; g2=st.session_state.gold2
+report=check_evidence(rows)
+eligible,excluded=route(rows,exploratory)
+strict,_=route(rows,False)
+cols=st.columns(5)
+for col,label,value in zip(cols,['Candidate records','Human approved / eligible','Current run eligible','Structural blockers','Confirmed 90-day outcomes'],[len(rows),len(strict),len(eligible),len(report['block_ids']),0]): col.metric(label,value)
+tabs=st.tabs(['1 · Evidence & approval','2 · Classify','3 · Research questions','4 · Segments & opportunities','5 · Evaluation','6 · Human correction & export'])
+with tabs[0]:
+    st.subheader('Review evidence and preserve source traceability')
+    st.caption('Approval requires both a verified observation and an explicit reviewer decision. The imported V1 approvals are carried forward; 17 Phase 2 source checks are not human approvals. Held sources stay excluded until corrected and explicitly verified.')
+    st.dataframe(rows,hide_index=True,use_container_width=True,column_config={'source_url':st.column_config.LinkColumn('Source URL')})
+    if report['issues']: st.dataframe(report['issues'],hide_index=True,use_container_width=True)
+    with st.form('review'):
+        ids=[r['record_id'] for r in rows]; rid=st.selectbox('Record to review',ids)
+        st.caption('Select the record ID using the table above. Enter verification only after checking the source and observation.')
+        check=st.selectbox('Source content check',['Verified','Pending','Hold','Rejected'])
+        decision=st.selectbox('Reviewer decision',['Pending','Approved','Hold','Rejected'])
+        notes=st.text_area('Reviewer notes / rationale')
+        if st.form_submit_button('Save record decision'):
+            if decision=='Approved' and (check!='Verified' or not notes.strip()): st.error('Verified content and reviewer rationale required for approval.')
             else:
-                corrections[select_id] = {
-                    "record_id": select_id, "source_url": r["source_url"],
-                    "original_ai_theme": p["primary_theme"], "reviewed_theme": corrected_theme,
-                    "original_ai_behavior": p["behavior_description"], "reviewed_behavior": corrected_behavior,
-                    "decision": human_decision, "rationale": human_reason.strip(),
-                    "source_gate": r["source_gate"],
-                }
-                st.success("Review saved in this session. Export the CSV to retain it.")
-        if corrections:
-            st.download_button("Download human-review audit CSV", csv_bytes(list(corrections.values())),
-                               file_name="human_correction_audit.csv", mime="text/csv")
-            st.caption(f"{len(corrections)} reviewed records in this session")
-
-with eval_tab:
-    st.subheader("AI agreement against the approved Golden Set")
-    st.caption("Agreement is diagnostic, not proof of causal accuracy. Reference labels were reviewed with AI assistance, so evaluation is not fully blind.")
-    if not golden_check["passed"]:
-        st.error("Fix golden-set validation issues before evaluating.")
-    else:
-        evaluation, metrics = evaluation_table(list(preds.values()), golden, eligible_ids)
-        q1,q2,q3,q4 = st.columns(4)
-        q1.metric("Golden set", metrics["golden_total"])
-        q2.metric("AI evaluated", metrics["evaluated"])
-        q3.metric("Matches", metrics["matching"])
-        q4.metric("Agreement", "Not measured" if metrics["agreement_rate"] is None else f"{metrics['agreement_rate']:.1%}")
-        if metrics["evaluated"] != len(golden):
-            st.warning(f"Only {metrics['evaluated']} of {len(golden)} golden records have live AI predictions. Do not report the partial result as full 20-record accuracy.")
-        st.dataframe(evaluation, hide_index=True, use_container_width=True)
-        st.download_button("Download AI vs human evaluation", csv_bytes(evaluation),
-                           file_name="golden_set_agreement_audit.csv", mime="text/csv")
-        mismatches = [r for r in evaluation if r["agreement"] == "mismatch"]
-        if mismatches:
-            st.markdown("#### Genuine disagreements to inspect")
-            st.dataframe(mismatches[:10], hide_index=True, use_container_width=True)
-        else:
-            st.caption("No observed disagreements yet; if the sample is incomplete, more predictions may reveal disagreements.")
-        st.divider()
-        st.markdown("**Evaluation safeguards**")
-        st.write("• AI predictions are generated from observation paraphrases, not human labels.\n\n"
-                 "• Only successful, live AI calls count; unavailable or blocked rows do not count as matches.\n\n"
-                 "• Each 90-day status remains unknown unless source language explicitly establishes the required timing and completion.\n\n"
-                 "• Do not claim a population repeat rate from public posts.")
-
-
-# Exploratory analyses depend ONLY on successfully classified, currently eligible public evidence.
-classified = join_predictions(rows, list(preds.values()), eligible_ids)
-with research_tab:
-    st.subheader("Eight assignment research questions — evidence coverage")
-    st.warning("The app reports partial signals, not completed answers where source evidence is missing. Public posts cannot determine qualified 90-day retention or distinguish silent non-returners.")
-    if not classified:
-        st.info("Run AI classification or upload your previously exported AI predictions CSV in the sidebar first.")
-    else:
-        coverage = []
-        for qid, question, _ in QUESTIONS:
-            matched = research_evidence(qid, classified)
-            status, limitation = question_status(qid, classified)
-            coverage.append({"question_id": qid, "question": question, "coverage": status, "supporting_observations": len(matched), "limitation": limitation})
-        st.dataframe(coverage, use_container_width=True, hide_index=True)
-        st.download_button("Download question coverage", csv_bytes(coverage), file_name="urban_company_research_question_coverage.csv", mime="text/csv")
-        qid = st.selectbox("Inspect supporting evidence", [q[0] for q in QUESTIONS], format_func=lambda x:next(q[1] for q in QUESTIONS if q[0]==x))
-        chosen = research_evidence(qid, classified)
-        status, gap = question_status(qid, classified)
-        st.markdown(f"**Coverage:** {status}. {gap}")
-        if chosen:
-            evidence_table = [{"record_id":r["record_id"], "source":r["source_type"], "category":r["service_category"], "city":r["city"],
-                               "primary_theme":r["primary_theme"], "behavior":r.get("ai_behavior_description",""),
-                               "reported_alternative":r.get("ai_external_alternative",""), "unmet_need":r.get("ai_unmet_need",""),
-                               "repeat_90d":r.get("ai_repeat_90d_status","unknown"), "source_url":r["source_url"]} for r in chosen]
-            st.dataframe(evidence_table, use_container_width=True, hide_index=True, column_config={"source_url":st.column_config.LinkColumn("Original source")})
-            st.download_button("Download selected evidence",csv_bytes(evidence_table),file_name=f"research_{qid}_evidence.csv",mime="text/csv")
-        else:
-            st.info("No source-grounded supporting records in the eligible classified evidence.")
-        st.caption("Source counts represent observed public posts, not the share of all customers. A theme match is a clue, not proof of expectation or repeat motive.")
-
-with segment_tab:
-    st.subheader("Descriptive comparisons by city and service category")
-    st.info("These are counts of non-representative classified observations. Household type and first-acquisition channel are not recorded consistently; do not fabricate them.")
-    if classified:
-        dimension = st.selectbox("Compare themes by", ["service_category", "city", "source_type"], format_func=lambda x:x.replace("_"," ").title())
-        summary = segment_counts(classified, dimension)
-        st.dataframe(summary, use_container_width=True, hide_index=True)
-        st.download_button("Download segment observations",csv_bytes(summary),file_name="urban_company_segment_theme_counts.csv",mime="text/csv")
-        st.caption(f"{len(classified)} eligible classified source observations; no adjusted city/category incidence estimates.")
-    else:
-        st.info("Classify evidence or upload the authentic predictions CSV to view these comparisons.")
-
-with opportunity_tab:
-    st.subheader("Candidate opportunities — transparent evidence comparison")
-    st.warning("Sorted by diversity of the observed source sample, NOT by estimated business impact. Effect size, segment reach and solution differentiation need primary research and validation.")
-    if classified:
-        candidates = opportunity_table(classified)
-        st.dataframe(candidates, use_container_width=True, hide_index=True)
-        st.download_button("Download candidate opportunity table",csv_bytes(candidates),file_name="urban_company_opportunity_candidates.csv",mime="text/csv")
-        selected = st.selectbox("Inspect evidence for an opportunity",list(OPPORTUNITIES))
-        subset = [r for r in classified if r["primary_theme"] in OPPORTUNITIES[selected]["themes"]]
-        st.write(f"**Potential mechanism:** {OPPORTUNITIES[selected]['mechanism']}")
-        st.write(f"**Interview test:** {OPPORTUNITIES[selected]['validation']}")
-        st.dataframe([{"record_id":r["record_id"],"theme":r["primary_theme"],"observed_behavior":r.get("ai_behavior_description",""),"source_url":r["source_url"]} for r in subset],
-                     use_container_width=True,hide_index=True,column_config={"source_url":st.column_config.LinkColumn("Source")})
-        st.markdown("**Still unknown:** true 90-day repeat outcomes; target-segment prevalence; causal effect on consideration or booking; customers with no further service need.")
-    else:
-        st.info("Run classification or import a genuine prediction export first.")
-
-st.divider()
-st.caption("Urban Company fellowship research prototype · No account access, no booking actions, no scraping · Research questions and opportunity comparisons are exploratory and require human validation.")
+                for r in rows:
+                    if r['record_id']==rid: r.update(source_check=check,review_decision=decision,review_notes=notes)
+                st.rerun()
+    with st.form('bulk_verified'):
+        checked_ids=[r['record_id'] for r in rows if r['source_check']=='Verified' and r['review_decision']=='Pending']
+        selected=st.multiselect('Already source-checked records to approve',checked_ids)
+        attest=st.checkbox('I personally reviewed these selected observations and accept them')
+        if st.form_submit_button('Approve selected evidence'):
+            if not selected or not attest: st.error('Select records and explicitly confirm your review.')
+            else:
+                for r in rows:
+                    if r['record_id'] in selected: r.update(review_decision='Approved',review_notes=r['review_notes']+' | Human reviewer accepted via batch approval.')
+                st.rerun()
+    st.download_button('Download reviewed evidence master',csv_bytes(rows),'evidence_reviewed.csv','text/csv')
+    st.subheader('Excluded from current run'); st.dataframe(excluded,hide_index=True,use_container_width=True)
+with tabs[1]:
+    st.subheader('Groq structured behavioural classification')
+    st.caption('Only record ID, category, city and observation are sent to the model. Human labels, approval notes and screening rationale are never included in the prompt.')
+    sig=hashlib.sha256(csv_bytes([{k:r.get(k,'') for k in REQUIRED} for r in rows])+model.encode()).hexdigest()
+    if st.session_state.get('prediction_sig')!=sig:
+        st.session_state.update(prediction_sig=sig,predictions=[],corrections={})
+    active={r['record_id'] for r in eligible}
+    batch=st.number_input('Maximum records this run',min_value=1,max_value=max(1,len(eligible)),value=min(20,max(1,len(eligible))))
+    if st.button('Run classification',disabled=not eligible or not key, type='primary'):
+        existing={p['record_id']:p for p in st.session_state.predictions if p['prediction_status']=='AI success'}
+        pending=[r for r in eligible if r['record_id'] not in existing][:int(batch)]
+        log={p['record_id']:p for p in st.session_state.predictions}
+        progress=st.progress(0.0); status=st.empty()
+        for i,r in enumerate(pending):
+            status.write(f"Classifying {r['record_id']} ({i+1}/{len(pending)})")
+            try: p=groq_classify(r,key,model)
+            except Exception as e: p={'record_id':r['record_id'],'source_url':r['source_url'],'model_id':model,'prediction_status':'AI error','error':str(e)[:400]}
+            p['run_utc']=datetime.now(timezone.utc).isoformat();log[r['record_id']]=p;st.session_state.predictions=list(log.values())
+            progress.progress((i+1)/len(pending))
+            if p['prediction_status']=='AI error' and any(x in p['error'] for x in ('HTTP 401','HTTP 403','HTTP 429')):
+                st.warning('Stopped on API authentication/rate-limit error. Resolve and run again.');break
+        status.write('Run finished. Failed records can be retried. No simulated predictions.')
+    preds=[p for p in st.session_state.predictions if p['record_id'] in active]
+    st.write(f"Successful predictions: {sum(p['prediction_status']=='AI success' for p in preds)} / {len(eligible)} eligible records")
+    st.dataframe(preds,hide_index=True,use_container_width=True)
+    if preds: st.download_button('Download raw AI evidence log',csv_bytes(preds),'ai_evidence_log.csv','text/csv')
+# Review corrections remain separate from raw AI predictions used in evaluation.
+corrected=[{**p,**st.session_state.corrections.get(p['record_id'],{})} for p in preds]
+strict_data=analysis_rows(corrected,rows,True)
+explore_data=analysis_rows(corrected,rows,False)
+with tabs[2]:
+    st.subheader('Eight assignment research questions')
+    use_provisional=st.checkbox('View exploratory answers (includes pending records)',value=False)
+    data=explore_data if use_provisional else strict_data
+    st.caption('Answers are candidate extracts from public paraphrases, not verified causal explanations. Q6 cannot compare confirmed 90-day cohorts without primary research. Q7 provides descriptive segment context only.')
+    export=[]
+    for k,q in QUESTIONS.items():
+        answers=[{'record_id':r['record_id'],'answer':r[k],'source_url':r['source_url'],'observation':r['observation_paraphrase'],'limitation':r['limitation']} for r in data if r.get(k,'').strip().lower() not in ('','not established')]
+        with st.expander(f'{q} — {len(answers)}/{len(data)} observations with a candidate answer'):
+            if answers: st.dataframe(answers,hide_index=True,use_container_width=True,column_config={'source_url':st.column_config.LinkColumn('Source')})
+            else: st.write('Research gap — no supported answer in the current classified records.')
+        export += [{'question':q,**a} for a in answers]
+    if export: st.download_button('Export research question evidence',csv_bytes(export),'research_questions.csv','text/csv')
+with tabs[3]:
+    st.subheader('Approved-evidence analysis')
+    st.caption('Only approved, verified successful records enter this dashboard. Counts describe this convenience sample. They do not estimate retention, severity or causal impact.')
+    if strict_data:
+        from collections import Counter
+        for field,label in [('repeat_signal','Reported repeat / switching signal'),('service_category','Service category'),('city','City'),('customer_segment','Customer evidence type'),('source_type','Source mix')]:
+            st.write(label); st.bar_chart([{'segment':k,'records':v} for k,v in Counter(r.get(field,'Unknown') for r in strict_data).items()],x='segment',y='records')
+        ranked=opportunities(strict_data)
+        st.subheader('Unmet-need hypotheses by frequency')
+        st.caption('Denominator: approved classified first-hand observations with a candidate unmet need, excluding contextual supplementary records. Distinct source types indicate breadth, not proof. Human review is required before product prioritization.')
+        st.dataframe(ranked,hide_index=True,use_container_width=True)
+        if ranked: st.download_button('Export opportunity signals',csv_bytes(ranked),'opportunities.csv','text/csv')
+    else: st.info('Run classification on approved evidence first.')
+with tabs[4]:
+    st.subheader('Reference evaluation — raw AI output only')
+    st.caption('V1 historical agreement: 13/20 (65%). Re-run both models on the same approved reference records for a comparable result. Phase 1 and Phase 2 labels were AI-assisted; optional holdout must be independently labelled.')
+    st.write('Phase 2 reference approval (separate from source approval)')
+    st.dataframe(g2,hide_index=True,use_container_width=True)
+    with st.form('gold2'):
+        gr=st.selectbox('Reference record',[r['record_id'] for r in g2]); confirmed=st.checkbox('I reviewed and accept the source, manual label, behaviour and notes')
+        if st.form_submit_button('Approve Phase 2 reference'):
+            if not confirmed: st.error('Explicit review confirmation required.')
+            else:
+                r=next((r for r in rows if r['record_id']==gr),None); gold=next(x for x in g2 if x['record_id']==gr)
+                if not r or r['source_check']!='Verified' or r['review_decision']!='Approved': st.error('Approve verified evidence in tab 1 first.')
+                elif gold.get('manual_label') not in TAXONOMY or not gold.get('manual_behavior','').strip(): st.error('Complete valid manual label and behaviour first.')
+                else: gold['human_review_status']='Approved';st.rerun()
+    with st.form('bulk_gold2'):
+        accepted={r['record_id'] for r in strict}
+        candidates=[g['record_id'] for g in g2 if g['record_id'] in accepted and g.get('human_review_status')=='Pending' and g.get('manual_label') in TAXONOMY and g.get('manual_behavior','').strip()]
+        selected_gold=st.multiselect('Approved evidence references to finalize',candidates)
+        accept_labels=st.checkbox('I accept the selected manual labels, behaviour and notes before seeing V2 predictions')
+        if st.form_submit_button('Finalize selected references'):
+            if not selected_gold or not accept_labels: st.error('Select references and confirm review.')
+            else:
+                for g in g2:
+                    if g['record_id'] in selected_gold: g['human_review_status']='Approved'
+                st.rerun()
+    st.download_button('Export Phase 2 reference',csv_bytes(g2),'golden_v2_reviewed.csv','text/csv')
+    for title,gold in [('V1 reference (AI-assisted)',g1),('Phase 2 reference (AI-assisted)',g2),('Optional holdout (independence must be confirmed)',holdout)]:
+        if not gold: continue
+        approved=approved_reference(gold,rows)
+        table,m,detail=score(preds,approved,active)
+        st.write(f'**{title}** — {len(approved)}/{len(gold)} approved and source eligible')
+        a,b,c=st.columns(3)
+        a.metric('Exact agreement',f"{m['agreement_rate']:.1%}" if m['agreement_rate'] is not None else 'Not evaluated')
+        b.metric('Coverage',f"{m['evaluated']}/{len(approved)}")
+        c.metric('Macro F1 (evaluated labels)',f"{m['macro_f1']:.3f}" if m['macro_f1'] is not None else 'Not evaluated')
+        st.dataframe(table,hide_index=True,use_container_width=True);st.dataframe(detail,hide_index=True,use_container_width=True)
+        if table: st.download_button('Export evaluation',csv_bytes(table),f'evaluation_{title.split()[0]}.csv','text/csv',key='export_'+title)
+    st.caption('Theme agreement is not behavioural extraction accuracy or source grounding accuracy. Those require human audit. Missing AI predictions are reflected in coverage.')
+with tabs[5]:
+    st.subheader('Human correction log')
+    good=[p for p in preds if p['prediction_status']=='AI success']
+    if good:
+        with st.form('correct'):
+            rid=st.selectbox('Prediction record',[p['record_id'] for p in good]); label=st.selectbox('Corrected primary theme',TAXONOMY); behavior=st.text_area('Corrected behaviour'); notes=st.text_area('Correction rationale'); grounded=st.selectbox('Grounding audit',['Not assessed','Supported','Unsupported'])
+            if st.form_submit_button('Save correction'):
+                if not behavior.strip() or not notes.strip(): st.error('Behaviour and rationale required.')
+                else: st.session_state.corrections[rid]={'primary_theme':label,'behavior_description':behavior,'correction_notes':notes,'grounding_audit':grounded};st.rerun()
+        st.dataframe(corrected,hide_index=True,use_container_width=True)
+        st.download_button('Export reviewed AI evidence',csv_bytes(corrected),'reviewed_ai_evidence.csv','text/csv')
+        logs=[{'record_id':k,**v} for k,v in st.session_state.corrections.items()]
+        if logs: st.download_button('Export correction log',csv_bytes(logs),'human_corrections.csv','text/csv')
+        st.caption('Corrections change theme and behaviour in the reviewed view only; question extracts still require review. Raw predictions remain unchanged for evaluation.')
+    else: st.info('Classify evidence first.')
+    st.warning('Review decisions and predictions live in the browser session. Export before closing; upload saved evidence and reference CSVs to restore decisions. Raw prediction re-import is not implemented in this version.')
